@@ -1,0 +1,8 @@
+{
+    "amazon": {
+        "accessKeyId": "",
+        "secretAccessKey": "",
+        "region": "us-west-2"
+    },
+    "workers": 4
+}
