@@ -4,5 +4,5 @@
         "secretAccessKey": "",
         "region": "us-west-2"
     },
-    "workers": 4
+    "workers": 1
 }
