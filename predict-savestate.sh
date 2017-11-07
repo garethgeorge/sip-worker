@@ -34,7 +34,7 @@ PERIOD=$((2592000*3))
 INSTTYPE="Linux"
 
 TARG=$HERE/results
-STATE=$HERE/bmbp_state
+STATE=$HERE
 
 # GMTOFF=`date --rfc-3339="seconds" | awk -F '-' '{print $4}' | awk -F':' '{print $1}'`
 

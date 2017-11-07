@@ -8,6 +8,7 @@ import subprocess
 import shutil 
 import time
 import logging
+import aiofiles
 from colors import *
 from datetime import datetime, timezone, timedelta
 from dateutil.relativedelta import relativedelta
@@ -28,23 +29,29 @@ epoch = datetime.utcfromtimestamp(0)
 epoch.replace(tzinfo=None)
 def util_time_to_epoc(datetime):
     return (datetime.replace(tzinfo=None) - epoch).total_seconds()
-    
+
+
 async def worker_entrypoint(loop):
-    global work_queue 
+    global work_queue, cruncher_ids
     print("initializing work queue.")
     
     work_queue = asyncio.PriorityQueue(loop=loop)
+    cruncher_ids = asyncio.Queue(loop=loop)
 
-    with open("instance-types.json", "r") as f:
+    with open("availability-zones.json", "r") as f:
         for id, job in enumerate(json.load(f)):
             await work_queue.put((0, id, job))
     
     print("\tLoaded %d jobs." % (work_queue.qsize(),))
 
     # spawn off a bunch of workers pulling from the work queue...
-    for x in range(0, config["workers"]):
+    print("\tfetch_workers")
+    for x in range(0, config["fetch_workers"]):
         print("\tstarted a worker... %d" % x)
         asyncio.ensure_future(Worker(x, work_queue, loop).run())
+
+    for x in range(0, config["crunch_workers"]):
+        await cruncher_ids.put(x)
 
 class Worker(object):
     def __init__(self, id, work_queue, loop):
@@ -79,10 +86,10 @@ class Worker(object):
 class WorkerTask(object):
     def __init__(self, worker, job):
         self.worker = worker
-        self.job = job 
+        self.job = job
         
-        self.prefix = "W%d %s-%s" % (self.worker.worker_id, job["az"], job["instance_type"])
-        self.state_dir = "state/%s.%s.%s/" % (job["region"], job["az"], job["instance_type"])
+        self.prefix = "W%d %s" % (self.worker.worker_id, job["az"])
+        self.state_dir = "./state/%s.%s/" % (job["region"], job["az"])
         if not os.path.isdir(self.state_dir):
             os.mkdir(self.state_dir)
 
@@ -94,8 +101,9 @@ class WorkerTask(object):
                 aws_access_key_id=config["amazon"]["accessKeyId"],
                 aws_secret_access_key=config["amazon"]["secretAccessKey"]) as client:
             if os.path.isfile(os.path.join(self.state_dir, "history.json")):
-                with open(os.path.join(self.state_dir, "history.json"), "r") as f:
-                    history_prior_obj = json.load(f)
+                async with aiofiles.open(os.path.join(self.state_dir, "history.json"), "r") as f:
+                    data = await f.read()
+                    history_prior_obj = json.loads(data)
                     history_prior = history_prior_obj["history"]
                     start_time = history_prior_obj["end_time"]
             else:
@@ -113,57 +121,95 @@ class WorkerTask(object):
             hp_t = set(self.history_record_to_tupple(rec) for rec in history_prior)
             history_new = [record for record in history_latest if self.history_record_to_tupple(record) not in hp_t]
 
-            self.worker.log("\t%s got %d new records after diffing" % (self.prefix, len(history_new)))
-
-            if len(history_new) > 10:
-                await self.process_diff(history_new)
-
+            if (await self.process_diff_batch(history_new)):
                 # NOTE: we only want to dump the history if this operation succeeds, otherwise 
                 # the history will get refetched and the diff reprocessed if there is an error
-                with open(os.path.join(self.state_dir, "history.json"), "w") as f:
-                    json.dump({
+                async with aiofiles.open(os.path.join(self.state_dir, "history.json"), "w") as f:
+                    await f.write(json.dumps({
                         "history": history_latest, # yes this is supposed to dump latest, not new
                         "end_time": end_time,
                         "start_time": start_time,
-                    }, f)
+                    }))
 
-    async def process_diff(self, records):
+    async def process_diff_batch(self, records):
+        self.worker.log("\t%s processing diff: %d records, identifying instance types that need processing." % (self.prefix, len(records)))
+        records = sorted(records, key=lambda record:(record["InstanceType"], record["Timestamp"]))
+
+        work = []
+        for instance_type, inst_records in itertools.groupby(records, key=lambda record:record["InstanceType"]):
+            inst_records = list(inst_records)
+            if len(inst_records) > 10:
+                self.worker.log("\t\t%s instance %s needs an update, %d records changed" % (self.prefix, instance_type, len(inst_records)))
+                work.append(asyncio.ensure_future(self.process_diff(instance_type, inst_records)))
+        
+        if len(work) > 0:
+            self.worker.log("\t%s pondorously crunching the numbers. please hold." % (self.prefix))
+            await asyncio.wait(work)
+            self.worker.log("\t%s done crunching." % (self.prefix))
+
+            return True
+        else:
+            self.worker.log("\t%s no numbers to crunch! Simply moving along." % (self.prefix))
+            return False 
+
+    async def process_diff(self, instance_type, records):
+        
+        print("blocking on request for an id")
+        id = await cruncher_ids.get()
         self.worker.log("\t%s processing diff and making predictions. records: %d" % (self.prefix, len(records)))
-
-        WORKDIR = "./tmp/worker-%x/" % self.worker.worker_id
         
-        if os.path.isdir(WORKDIR):
-            shutil.rmtree(WORKDIR)
-        os.mkdir(WORKDIR)
+        working_dir = "./tmp/worker-%x/" % id 
+        data_file = os.path.join(working_dir, "data.txt")
+        state_file = os.path.join(self.state_dir, "%s.state" % instance_type)
+        results_dir = os.path.join(working_dir, "results")
+        archive_results_dir = self.state_dir + "/results/" + instance_type + "/" + datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
 
-        # with open(os.path.join(WORKDIR, "data.txt"), "w") as f:
-        #     for record in records:
-        #         f.write(self.history_tuple_to_line(self.history_record_to_tupple(record)) + "\n")
+        os.makedirs(archive_results_dir, exist_ok=True)
 
-        # args = ["sh", "./predict.sh"]
-        # args += [WORKDIR]
-        # args += [self.job["region"], self.job["az"]]
+        if os.path.isdir(working_dir):
+            print("removing working directory...")
+            shutil.rmtree(working_dir)
+            print("done removing it...")
+        os.makedirs(working_dir)
 
-        # p = subprocess.Popen(args)
-        # p.wait()
 
-        with open(os.path.join(WORKDIR, "data.txt"), "w") as f:
+        # write out the input data
+        async with aiofiles.open(data_file, "w") as f:
             for record in records:
-                ts = util_time_to_epoc(datetime.strptime(record["Timestamp"], "%Y-%m-%dT%H:%M:%S.000Z"))
-                val = record["SpotPrice"]
-                f.write("%d %.5f\n" % (ts, val))
-        
-        args = ["./bin/bmbp_ts"]
-        args += ["-f", os.path.join(WORKDIR, "data.txt")]
-        args += ["-q", "0.975", "-c", "0.01", "-T"]
-        statefile = os.path.join(self.state_dir, "bmbp_ts.state")
-        if os.path.exists(statefile):
-            args += ["--loadstate", statefile]
-        args += ["--savestate", statefile]
-        p = subprocess.Popen(args, stdout=subprocess.PIPE)
-        print(p.stdout.read().decode('ascii'))
-        p.wait()
+                await f.write(self.history_tuple_to_line(self.history_record_to_tupple(record)) + "\n")
 
+        self.worker.log("\t%s beginning to execute the shell script..." % (self.prefix,))
+
+        # copy over the binary state file 
+        args = ("sh", "./predict-savestate.sh")
+        args += (working_dir,)
+        args += (self.job["region"], self.job["az"])
+
+        p = await asyncio.create_subprocess_exec(*args)
+        returncode = await p.wait()
+        
+        self.worker.log("\t%s processed diff, exit status %d" % (self.prefix, returncode))
+        
+        # check that all of the expected files are there
+        # TODO: copy in the state save and state restore stuff
+        for path in [results_dir]:
+            if not os.path.exists(path):
+                cruncher_ids.put(id)
+                raise Exception("when checking result files, did not get file \"%s\"" % (path,))
+            else:
+                self.worker.log("\t\t%s result \"%s\" OK" % (self.prefix, path))
+        self.worker.log("\t%s archiving!" % (self.prefix,))
+
+        for file in os.listdir(results_dir):
+            self.worker.log("\t\t%s - archived %s" % (self.prefix, file))
+            with open(results_dir + '/' + file, 'r') as rd:
+                with open(archive_results_dir + '/' + file, 'w') as wr:
+                    wr.write(rd.read())
+        self.worker.log("\t%s done processing!" % (self.prefix,))
+
+        await cruncher_ids.put(id)
+
+        return 0
         
     async def get_spot_price_history(self, client, history_seconds=None, start_time_string=None):
         pag = client.get_paginator("describe_spot_price_history")
@@ -180,7 +226,7 @@ class WorkerTask(object):
             "StartTime": start_time_string,
             "ProductDescriptions": ["Linux/UNIX"],
             "AvailabilityZone": self.job["az"],
-            "InstanceTypes": [self.job["instance_type"]]
+            # "InstanceTypes": [self.job["instance_type"]]
         }
 
         iterator = pag.paginate(**params)

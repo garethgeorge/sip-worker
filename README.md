@@ -15,6 +15,7 @@ pip install termcolor
     - https://motor.readthedocs.io/en/stable/tutorial-asyncio.html
  - term color for colored output based on worker number 
  - aiofiles - writing out files asynchronously
+ - aiojson - writing json files asynchronously
 
 
 # configuration 
