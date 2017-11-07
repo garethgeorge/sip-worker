@@ -14,6 +14,7 @@ pip install termcolor
  - motor - async mongodb interaction
     - https://motor.readthedocs.io/en/stable/tutorial-asyncio.html
  - term color for colored output based on worker number 
+ - aiofiles - writing out files asynchronously
 
 
 # configuration 

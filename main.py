@@ -6,6 +6,8 @@ from worker import worker_entrypoint
 
 app = web.Application()
 
+print("Latest version!")
+
 
 async def route_data(request):
     # TODO: write code here that gets the latest data for the provided 

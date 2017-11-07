@@ -34,6 +34,7 @@ PERIOD=$((2592000*3))
 INSTTYPE="Linux"
 
 TARG=$HERE/results
+STATE=$HERE/bmbp_state
 
 # GMTOFF=`date --rfc-3339="seconds" | awk -F '-' '{print $4}' | awk -F':' '{print $1}'`
 
@@ -62,16 +63,21 @@ for TYPE in `awk '{print $3}' $FILE | sort | uniq` ; do
 
     $BIN/spot-price-aggregate -f $F | sort -n -k 1 -k 2 | uniq | awk '{if ($1 > 1422228412) {print $1,$2}}' > $TARG/$REGION-$AZ-$TYPE-agg.txt
 
-    $BIN/bmbp_ts -f $TARG/$REGION-$AZ-$TYPE-agg.txt -T -i 350 -q 0.975 -c 0.01 | grep "pred:" | awk '{print $2,$4,($6+0.0001),$14}' > $TARG/$REGION-$AZ-$TYPE-pred.txt
+    if [ -e $STATE/$TYPE.state ] 
+    then 
+        $BIN/bmbp_ts -f $TARG/$REGION-$AZ-$TYPE-agg.txt -T -i 350 -q 0.975 -c 0.01 --loadstate $STATE/$TYPE.loadstate --savestate $STATE/$TYPE.savestate | grep "pred:" | awk '{print $2,$4,($6+0.0001),$14}' > $TARG/$REGION-$AZ-$TYPE-pred.txt
+    else 
+        $BIN/bmbp_ts -f $TARG/$REGION-$AZ-$TYPE-agg.txt -T -i 350 -q 0.975 -c 0.01 --savestate $STATE/$TYPE.savestate | grep "pred:" | awk '{print $2,$4,($6+0.0001),$14}' > $TARG/$REGION-$AZ-$TYPE-pred.txt
+    fi
 
     awk '{print $1,$2,$3}' $TARG/$REGION-$AZ-$TYPE-pred.txt > $TARG/$REGION-$AZ-$TYPE-temp.txt
 
     $BIN/pred-duration -f $TARG/$REGION-$AZ-$TYPE-temp.txt -T 0 -e | sort -n -k 2 > $TARG/$REGION-$AZ-$TYPE-duration.txt
-
+    
     $BIN/pred-distribution-fast -f $TARG/$REGION-$AZ-$TYPE-temp.txt -q 0.025 -c 0.99 -F 4.0 -I 0.05 | awk '{print $1/3600,$2}' > $TARG/$TYPE.pgraph
 
     DSIZE=`wc -l $TARG/$REGION-$AZ-$TYPE-duration.txt | awk '{print $1}'`
 
     $BIN/bmbp_index -s $DSIZE -q 0.025 -c 0.99 > $TARG/$REGION-$AZ-$TYPE-ndx.txt
-
+    
 done
