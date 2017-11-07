@@ -35,10 +35,11 @@ INSTTYPE="Linux"
 
 TARG=$HERE/results
 
-GMTOFF=`date --rfc-3339="seconds" | awk -F '-' '{print $4}' | awk -F':' '{print $1}'`
+# GMTOFF=`date --rfc-3339="seconds" | awk -F '-' '{print $4}' | awk -F':' '{print $1}'`
 
 mkdir -p $TARG
 
+GMTOFF=`date +%z`
 NOW=`/bin/date +%s`
 NOW=$(($NOW-($GMTOFF*3600)))
 # 3 month earlier
@@ -57,7 +58,7 @@ for TYPE in `awk '{print $3}' $FILE | sort | uniq` ; do
 
 	$BIN/convert_time -f $HERE/$AZ/$TYPE.$INSTTYPE.temp1 | sort -n -k 1 -k 2 | awk -v gmt=$GMTOFF '{print $1-(gmt*3600),$2}' | awk -v early=$EARLIEST '{if($1 >= early) {print $1,$2}}' > $HERE/$AZ/$TYPE.$INSTTYPE.temp2
 
-	F="$HERE/$AZ/$TYPE.$INSTTYPE.temp2"
+    F="$HERE/$AZ/$TYPE.$INSTTYPE.temp2"
 
   $BIN/spot-price-aggregate -f $F | sort -n -k 1 -k 2 | uniq | awk '{if ($1 > 1422228412) {print $1,$2}}' > $TARG/$REGION-$AZ-$TYPE-agg.txt
 

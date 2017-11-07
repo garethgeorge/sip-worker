@@ -1,34 +1,29 @@
 import aiobotocore
 import asyncio
 import botocore 
+import itertools 
 import json 
 import os 
-import itertools 
-import subprocess 
+import subprocess
+import shutil 
 import time
+import logging
+from colors import *
 from datetime import datetime, timezone, timedelta
 from dateutil.relativedelta import relativedelta
+
+logger = logging.getLogger(__name__)
 
 from config import config 
 
 if not os.path.isdir("state"):
     os.mkdir("state")
-if not os.path.isdir("state/bmbp_ts"):
-    os.mkdir("state/bmbp_ts")
-if not os.path.isdir("state/aws"):
-    os.mkdir("state/aws")
+if not os.path.isdir("tmp"):
+    os.mkdir("tmp")
 
-RED   = "\033[1;31m"  
-BLUE  = "\033[1;34m"
-CYAN  = "\033[1;36m"
-GREEN = "\033[0;32m"
-RESET = "\033[0;0m"
-BOLD    = "\033[;1m"
-REVERSE = "\033[;7m"
 worker_colors = [BOLD, RED, BLUE, CYAN, GREEN]
 color_clear = RESET
 
-# TODO: make the workers actually process stuff
 epoch = datetime.utcfromtimestamp(0)
 epoch.replace(tzinfo=None)
 def util_time_to_epoc(datetime):
@@ -41,8 +36,8 @@ async def worker_entrypoint(loop):
     work_queue = asyncio.PriorityQueue(loop=loop)
 
     with open("instance-types.json", "r") as f:
-        for job in json.load(f):
-            await work_queue.put((0, job))
+        for id, job in enumerate(json.load(f)):
+            await work_queue.put((0, id, job))
     
     print("\tLoaded %d jobs." % (work_queue.qsize(),))
 
@@ -64,8 +59,8 @@ class Worker(object):
 
     async def run(self):
         while True:
-            last_time, job = await self.work_queue.get()
-            wait_time = ((last_time + config["recheck_interval"]) - time.time()) # don't check more often than every sixty seconds
+            last_time, jobid, job = await self.work_queue.get()
+            wait_time = ((last_time + config["recheck_interval"]) - time.time()) # don"t check more often than every sixty seconds
             if wait_time > 0:
                 self.log("Worker %d took job, waiting %d seconds to execute. " % (self.worker_id, wait_time))
                 await asyncio.sleep(abs(wait_time))
@@ -74,8 +69,11 @@ class Worker(object):
                 self.log("Worker %d took job. Executing immediately" % self.worker_id)
 
             task = WorkerTask(self, job)
+            # try: # in production we will want a try catch here... yep yep.
             await task.run()
-            await self.work_queue.put((time.time(), job))
+            # except Exception as e:
+            #     self.log("ERROR!!! ERROR!!! ERROR!!! %r" % (e,))
+            await self.work_queue.put((time.time(), jobid, job))
             self.log("Worker %d done." % self.worker_id)
 
 class WorkerTask(object):
@@ -83,7 +81,6 @@ class WorkerTask(object):
         self.worker = worker
         self.job = job 
         
-        self.tag = "%s.%s.%s" % (job["region"], job["az"], job["instance_type"])
         self.prefix = "W%d %s-%s" % (self.worker.worker_id, job["az"], job["instance_type"])
         self.state_dir = "state/%s.%s.%s/" % (job["region"], job["az"], job["instance_type"])
         if not os.path.isdir(self.state_dir):
@@ -105,27 +102,71 @@ class WorkerTask(object):
                 history_prior = []
                 start_time = None
             
+            self.worker.log("\t%s fetched fetching price data " % (self.prefix,))
             if start_time:
                 start_time, end_time, history_latest = await self.get_spot_price_history(client, start_time_string=start_time)
             else:
                 start_time, end_time, history_latest = await self.get_spot_price_history(client, history_seconds=config["history_window"])
-            self.worker.log("\t%s fetched %d records of spot price data. " % (self.prefix, len(history_latest)))
-            self.worker.log("\t%s diffing spot price data against prior records. " % (self.prefix,))
             
+            self.worker.log("\t%s got %d records, diffing spot price data against prior data" % (self.prefix,  len(history_latest)))
 
             hp_t = set(self.history_record_to_tupple(rec) for rec in history_prior)
             history_new = [record for record in history_latest if self.history_record_to_tupple(record) not in hp_t]
-            print(history_new)
 
-            with open(os.path.join(self.state_dir, "history.json"), "w") as f:
-                json.dump({
-                    "history": history_latest,
-                    "end_time": end_time,
-                    "start_time": start_time,
-                }, f)
+            self.worker.log("\t%s got %d new records after diffing" % (self.prefix, len(history_new)))
+
+            if len(history_new) > 10:
+                await self.process_diff(history_new)
+
+                # NOTE: we only want to dump the history if this operation succeeds, otherwise 
+                # the history will get refetched and the diff reprocessed if there is an error
+                with open(os.path.join(self.state_dir, "history.json"), "w") as f:
+                    json.dump({
+                        "history": history_latest, # yes this is supposed to dump latest, not new
+                        "end_time": end_time,
+                        "start_time": start_time,
+                    }, f)
+
+    async def process_diff(self, records):
+        self.worker.log("\t%s processing diff and making predictions. records: %d" % (self.prefix, len(records)))
+
+        WORKDIR = "./tmp/worker-%x/" % self.worker.worker_id
+        
+        if os.path.isdir(WORKDIR):
+            shutil.rmtree(WORKDIR)
+        os.mkdir(WORKDIR)
+
+        # with open(os.path.join(WORKDIR, "data.txt"), "w") as f:
+        #     for record in records:
+        #         f.write(self.history_tuple_to_line(self.history_record_to_tupple(record)) + "\n")
+
+        # args = ["sh", "./predict.sh"]
+        # args += [WORKDIR]
+        # args += [self.job["region"], self.job["az"]]
+
+        # p = subprocess.Popen(args)
+        # p.wait()
+
+        with open(os.path.join(WORKDIR, "data.txt"), "w") as f:
+            for record in records:
+                ts = util_time_to_epoc(datetime.strptime(record["Timestamp"], "%Y-%m-%dT%H:%M:%S.000Z"))
+                val = record["SpotPrice"]
+                f.write("%d %.5f\n" % (ts, val))
+        
+        args = ["./bin/bmbp_ts"]
+        args += ["-f", os.path.join(WORKDIR, "data.txt")]
+        args += ["-q", "0.975", "-c", "0.01", "-T"]
+        statefile = os.path.join(self.state_dir, "bmbp_ts.state")
+        if os.path.exists(statefile):
+            args += ["--loadstate", statefile]
+        args += ["--savestate", statefile]
+        p = subprocess.Popen(args, stdout=subprocess.PIPE)
+        print(p.stdout.read().decode('ascii'))
+        p.wait()
+
         
     async def get_spot_price_history(self, client, history_seconds=None, start_time_string=None):
-        pag = client.get_paginator('describe_spot_price_history')
+        pag = client.get_paginator("describe_spot_price_history")
 
         end_time = datetime.now()
         if start_time_string == None:
@@ -135,17 +176,17 @@ class WorkerTask(object):
         end_time_string = end_time.strftime("%Y-%m-%dT%H:%M:%S")
 
         params = {
-            'EndTime': end_time_string,
-            'StartTime': start_time_string,
-            'ProductDescriptions': ['Linux/UNIX'],
-            'AvailabilityZone': self.job["az"],
-            'InstanceTypes': [self.job["instance_type"]]
+            "EndTime": end_time_string,
+            "StartTime": start_time_string,
+            "ProductDescriptions": ["Linux/UNIX"],
+            "AvailabilityZone": self.job["az"],
+            "InstanceTypes": [self.job["instance_type"]]
         }
 
         iterator = pag.paginate(**params)
         spot_prices = []
         async for page in iterator:
-            for spotdata in page['SpotPriceHistory']:
+            for spotdata in page["SpotPriceHistory"]:
                 nicedata = {
                     "InstanceType": spotdata["InstanceType"],
                     "ProductDescription": spotdata["ProductDescription"],
@@ -167,91 +208,5 @@ class WorkerTask(object):
         return (self.job["az"], record["InstanceType"], record["ProductDescription"], float(record["SpotPrice"]), record["Timestamp"])
 
     def history_tuple_to_line(self, record):
-        return "SPOTPRICEHISTORY\t%s\t%s\t%s\t%.4f\t%s" % (record[0], record[1], record[2], record[3], record[4], record[5])
+        return "SPOTPRICEHISTORY\t%s\t%s\t%s\t%.4f\t%s" % record
         # return string.Template("SPOTPRICEHISTORY\t$az\t$instance_type\t$product_description\t$spot_price\t$timestamp"")
-
-def historyRecordsToTupples(historyRecords):
-    return [(record["time"], record["spotprice"], record["type"]) for record in historyRecords]
-
-def historyRecordsFromTupples(historyRecords):
-    return [{"time": record[0], "spotprice": record[1], "type": record[2]} for record in historyRecords]
-
-async def worker(loop, workerId):
-    while True:
-        last_time, job = await work_queue.get()
-        wait_time = (time.time() - (last_time + 5)) # don't check more often than every sixty seconds
-        if wait_time < 0:
-            print("Worker %d took job, waiting %d seconds to execute. " % (workerId, abs(wait_time)))
-            await asyncio.sleep(abs(wait_time))
-            print("Worker %d done waiting, executing job now." % workerId)
-        else:
-            print("Worker %d took job. Executing immediately" % workerId)
-
-        session = aiobotocore.get_session(loop=loop)
-
-        async with session.create_client("ec2", region_name=job["region"],
-                aws_access_key_id=config["amazon"]["accessKeyId"],
-                aws_secret_access_key=config["amazon"]["secretAccessKey"]) as client:
-            tag = "%s.%s.%s" % (job["region"], job["az"], job["instance_type"])
-            state_dir = "state/%s.%s.%s/" % (job["region"], job["az"], job["instance_type"])
-            if not os.path.isdir(state_dir):
-                os.mkdir(state_dir)
-            
-            # collect the data 
-            print("collecting data... " + tag)
-            try:
-                history_full = await client.describe_spot_price_history(
-                    AvailabilityZone=job["az"],
-                    InstanceTypes=[job["instance_type"]]
-                )
-                print(history_full['NextToken'])
-                history_full = history_full['SpotPriceHistory']
-            except botocore.exceptions.ClientError as e:
-                work_queue.put((time.time(), job))
-                continue 
-            history_full = [{"time": int(util_time_to_epoc(record["Timestamp"])),
-                             "spotprice": float(record["SpotPrice"]), 
-                             "type": str(record["ProductDescription"])} for record in history_full]
-
-            # diff the data against the prior state 
-            print("diffing data ... " + tag)
-            history_file = os.path.join(state_dir, "history.json")
-            if os.path.isfile(history_file):
-                with open(history_file, "r") as f:
-                    history_full_prior = json.load(f)
-            else:
-                history_full_prior = None
-
-            if history_full_prior:
-                pft_t = set(historyRecordsToTupples(history_full_prior))
-                ft_t = historyRecordsToTupples(history_full)
-                history_new = [record for record in pft_t if record not in pft_t]
-                history_new = historyRecordsFromTupples(history_new)
-            else:
-                history_new = history_full
-            
-            # if the diff is large enough do processing, otherwise we should pass on this loop and wait
-            if len(history_new) > 100:
-                data = sorted(history_new, key=lambda record: (record["type"], record["time"]))
-                print(data)
-
-                with open(history_file, "w") as f:
-                    json.dump(history_full, f)
-
-                for type, group in itertools.groupby(data, key=(lambda record: record["type"])):
-                    bmbpts_input = os.path.join(state_dir, type + "-bmbp_ts_input.txt")
-                    bmbpts_state = os.path.join(state_dir, type + "-state.bmbpts")
-                    with open(bmbpts_input) as f:
-                        f.writelines("%s %s" % (record["time"], record["type"]) for record in group)
-
-                    args = ["./bin/bmbp_ts", "-f", bmbpts_input]
-                    if os.path.isfile(bmbpts_state):
-                        args += ["--loadstate", bmbpts_state]
-                    args += ["--savestate", bmbpts_state]
-                    args += ["-T"]
-
-                    p = subprocess.Popen(args, stdout=subprocess.PIPE)
-                    p.wait()
-                    print(p.stdout.read())
-
-        await work_queue.put((time.time(), job))
